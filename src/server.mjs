@@ -12,12 +12,13 @@ const respond = (res, status, error) => { res.writeHead(status, { 'Content-Type'
 const reject = (socket, status) => { socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
 const hop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'set-cookie']);
 
-/** Legacy hosts remain supported. Open registration is explicit and needs durable storage. */
-export function createRelayServer({ hosts = {}, registration, tls, allowInsecureLoopback = false, requestTimeout = 60000 }) {
-  if (!hosts || Object.entries(hosts).some(([id, h]) => !/^[A-Za-z0-9_-]{1,64}$/.test(id) || !/^[a-f0-9]{64}$/.test(h))) throw new Error('Invalid hosts configuration');
+/** Only dynamically registered computers can authenticate. */
+export function createRelayServer(options) {
+  if (Object.hasOwn(options, 'hosts')) throw new Error('Static hosts are no longer supported; back up and remove hosts, then configure registration.database');
+  const { registration, tls, allowInsecureLoopback = false, requestTimeout = 60000 } = options;
+  if (!registration?.database) throw new Error('Registration database required');
   const online = new Map();
-  if (registration?.enabled && !registration.database) throw new Error('Registration database required');
-  const registry = registration?.database ? openRegistry(registration.database, registration.maxHosts ?? 1000) : undefined;
+  const registry = openRegistry(registration.database, registration.maxHosts ?? 1000);
   const enrollRates = new Map();
   const rates = new Map();
   const agents = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME, perMessageDeflate: false });
@@ -34,7 +35,7 @@ export function createRelayServer({ hosts = {}, registration, tls, allowInsecure
   }
   function destination(req) {
     // Match the raw path: no normalization may turn a different route into /api.
-    const match = /^\/h\/([A-Za-z0-9_-]{1,64})(\/api\/[A-Za-z0-9._/-]+(?:\?[^\r\n#]*)?)$/.exec(req.url || '');
+    const match = /^\/h\/([a-f0-9]{32})(\/api\/[A-Za-z0-9._/-]+(?:\?[^\r\n#]*)?)$/.exec(req.url || '');
     if (!match || match[2].split('?')[0].split('/').includes('..')) return;
     const tunnel = online.get(match[1]);
     return { tunnel, path: match[2] };
@@ -74,8 +75,6 @@ export function createRelayServer({ hosts = {}, registration, tls, allowInsecure
       } catch { return respond(res, 400, 'invalid_request'); }
       try {
         // Client-generated identity prevents credential loss when a response is lost.
-        const candidate = createHash('sha256').update('dsh-remote-host-v1:' + token).digest('hex').slice(0, 32);
-        if (Object.hasOwn(hosts, candidate)) return respond(res, 409, 'legacy_identity_conflict');
         const hostId = registry.register(token, name);
         if (!hostId) return respond(res, 503, 'registration_capacity_reached');
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -109,10 +108,10 @@ export function createRelayServer({ hosts = {}, registration, tls, allowInsecure
     socket.on('error', () => {});
     if (!transportAllowed(req)) return reject(socket, 403);
     if (!limit(req)) return reject(socket, 429);
-    const match = /^\/relay\/v1\/agent\/([A-Za-z0-9_-]{1,64})$/.exec(req.url || '');
+    const match = /^\/relay\/v1\/agent\/([a-f0-9]{32})$/.exec(req.url || '');
     if (match) {
       const id = match[1], token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
-      const expected = Object.hasOwn(hosts, id) ? hosts[id] : registry?.tokenHash(id);
+      const expected = registry.tokenHash(id);
       if (!token || !expected || !timingSafeEqual(digest(token), Buffer.from(expected, 'hex'))) return reject(socket, 401);
       if (online.has(id)) return reject(socket, 409);
       return agents.handleUpgrade(req, socket, head, ws => {

@@ -4,8 +4,8 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import { once } from 'node:events';
-import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -44,12 +44,16 @@ async function fixture(t, secure = false) {
     wss.handleUpgrade(req, socket, head, ws => ws.on('message', (data, binary) => ws.send(data, { binary })));
   });
   desktop.listen(0, '127.0.0.1'); await once(desktop, 'listening');
-  const relay = createRelayServer({ hosts: { synthetic: createHash('sha256').update(registration).digest('hex') }, tls, allowInsecureLoopback: !secure });
+  const relay = createRelayServer({ registration: { enabled: true, database: join(directory, 'hosts.sqlite') }, tls, allowInsecureLoopback: !secure });
   relay.server.listen(0, '127.0.0.1'); await once(relay.server, 'listening');
   const origin = `${secure ? 'https' : 'http'}://127.0.0.1:${relay.server.address().port}`;
+  let hostId;
+  const registered = await request('/relay/v1/register', JSON.stringify({ name: 'Synthetic computer' }), { Authorization: 'Bearer ' + registration, 'Content-Type': 'application/json' });
+  assert.equal(registered.status, 200);
+  hostId = JSON.parse(registered.data).hostId;
   const agents = [], sockets = new Set();
   async function agent(token = registration) {
-    const ws = new WebSocket(origin.replace(/^http/, 'ws') + '/relay/v1/agent/synthetic', {
+    const ws = new WebSocket(origin.replace(/^http/, 'ws') + '/relay/v1/agent/' + hostId, {
       headers: { Authorization: 'Bearer ' + token }, ...(tls ? { ca: tls.cert } : {}),
     });
     agents.push(ws);
@@ -64,6 +68,7 @@ async function fixture(t, secure = false) {
     });
   }
   function request(path, body, headers = {}, ca = tls?.cert) {
+    path = path.replace('/h/synthetic/', '/h/' + hostId + '/');
     return new Promise((resolve, reject) => {
       const req = (tls ? https : http).request(origin + path, {
         method: body === undefined ? 'GET' : 'POST', ca,
@@ -83,7 +88,7 @@ async function fixture(t, secure = false) {
     await new Promise(resolve => desktop.close(resolve));
     rmSync(directory, { recursive: true, force: true });
   });
-  return { relay, origin, agent, request, device, registration, tls };
+  return { relay, origin, hostId, agent, request, device, registration, tls };
 }
 
 test('health, offline isolation, authenticated registration and bounded HTTP forwarding', { timeout: 15000 }, async t => {
@@ -92,7 +97,7 @@ test('health, offline isolation, authenticated registration and bounded HTTP for
   assert.equal((await f.request('/h/synthetic/api/echo')).status, 503);
   await assert.rejects(f.agent(randomBytes(32).toString('hex')), /401/);
   await f.agent(); await assert.rejects(f.agent(), /409/);
-  assert.equal((await f.request('/h/other/api/echo')).status, 503);
+  assert.equal((await f.request('/h/' + '0'.repeat(32) + '/api/echo')).status, 503);
   assert.equal((await f.request('/h/synthetic/not-api')).status, 404);
   assert.equal((await f.request('/h/synthetic/api/echo', undefined, { Authorization: 'Bearer invalid' })).status, 401);
   const payload = randomBytes(1024 * 1024 + 17);
@@ -108,12 +113,12 @@ test('health, offline isolation, authenticated registration and bounded HTTP for
 
 test('WebSocket and SSE forwarding use the same synthetic host', { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.agent();
-  const ws = new WebSocket(f.origin.replace(/^http/, 'ws') + '/h/synthetic/api/events.mux', { headers: { Authorization: 'Bearer ' + f.device } });
+  const ws = new WebSocket(f.origin.replace(/^http/, 'ws') + '/h/' + f.hostId + '/api/events.mux', { headers: { Authorization: 'Bearer ' + f.device } });
   t.after(() => ws.terminate()); await once(ws, 'open');
   const reply = once(ws, 'message'); ws.send('synthetic-message');
   assert.equal((await reply)[0].toString(), 'synthetic-message');
   await new Promise((resolve, reject) => {
-    const req = http.get(f.origin + '/h/synthetic/api/events.host', { headers: { Authorization: 'Bearer ' + f.device } }, res => {
+    const req = http.get(f.origin + '/h/' + f.hostId + '/api/events.host', { headers: { Authorization: 'Bearer ' + f.device } }, res => {
       res.once('data', chunk => {
         try { assert.match(chunk.toString(), /synthetic-event/); resolve(); } catch (error) { reject(error); }
         res.destroy();
@@ -128,15 +133,19 @@ test('HTTPS and WSS require a trusted certificate', { timeout: 15000 }, async t 
   await assert.rejects(f.request('/healthz', undefined, {}, []), /certificate|self.signed/i);
 });
 
-test('provisioning hashes a synthetic credential and refuses to overwrite a directory', () => {
+test('legacy static hosts and provisioning arguments are rejected without creating files', () => {
+  assert.throws(() => createRelayServer({ hosts: {}, registration: { database: ':memory:' } }), /Static hosts/);
+  assert.throws(() => createRelayServer({}), /database required/);
   const parent = mkdtempSync(join(tmpdir(), 'dsh-provision-test-'));
   const destination = join(parent, 'private');
   try {
-    const args = ['src/provision.mjs', destination, 'synthetic', 'https://relay.example.com:8443'];
+    const args = ['src/provision.mjs', destination];
+    assert.throws(() => execFileSync(process.execPath, [...args, 'synthetic', 'https://relay.example.test'], { stdio: 'ignore', windowsHide: true }));
+    assert.equal(existsSync(destination), false);
     execFileSync(process.execPath, args, { stdio: 'ignore', windowsHide: true });
     const server = JSON.parse(readFileSync(join(destination, 'server.json')));
-    const plugin = JSON.parse(readFileSync(join(destination, 'plugin-secret.json')));
-    assert.equal(server.hosts.synthetic, createHash('sha256').update(plugin.registrationToken).digest('hex'));
+    assert.equal(server.hosts, undefined);
+    assert.equal(server.registration.enabled, true);
     assert.equal(server.bind, '127.0.0.1');
     assert.throws(() => execFileSync(process.execPath, args, { stdio: 'ignore', windowsHide: true }));
   } finally { rmSync(parent, { recursive: true, force: true }); }

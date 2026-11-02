@@ -56,7 +56,7 @@ test('automatic registration: retries, rename, restart, isolation, credential ch
 });
 
 test('registration is opt-in, rate limited and provisioning needs no computer information', async t => {
-  let relay = createRelayServer({ allowInsecureLoopback: true });
+  let relay = createRelayServer({ allowInsecureLoopback: true, registration: { enabled: false, database: ':memory:' } });
   relay.server.listen(0, '127.0.0.1'); await once(relay.server, 'listening');
   assert.equal((await fetch('http://127.0.0.1:' + relay.server.address().port + '/relay/v1/register', { method: 'POST' })).status, 403);
   await relay.close();
