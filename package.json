@@ -1,0 +1,24 @@
+{
+  "name": "dsh-remote-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Server backend for dsh-remote",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node src/main.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0"
+  }
+}

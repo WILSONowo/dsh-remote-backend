@@ -1,0 +1,13 @@
+node_modules/
+lib/
+*.tgz
+*.log
+.env
+.env.*
+!.env.example
+relay-private/
+server.json
+plugin-secret.json
+*.pem
+*.key
+artifacts/
