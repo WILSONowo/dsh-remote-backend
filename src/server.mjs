@@ -3,6 +3,7 @@ import https from 'node:https';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { Tunnel, MAX_FRAME } from '../lib/tunnel.js';
+import { openRegistry } from './registry.mjs';
 
 const digest = s => createHash('sha256').update(s).digest();
 const safeHeaders = headers => Object.fromEntries(Object.entries(headers).filter(([k]) =>
@@ -11,10 +12,13 @@ const respond = (res, status, error) => { res.writeHead(status, { 'Content-Type'
 const reject = (socket, status) => { socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
 const hop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'set-cookie']);
 
-/** hosts contains pre-provisioned host IDs and SHA-256 registration-token hashes. No user database or web UI. */
-export function createRelayServer({ hosts, tls, allowInsecureLoopback = false, requestTimeout = 60000 }) {
+/** Legacy hosts remain supported. Open registration is explicit and needs durable storage. */
+export function createRelayServer({ hosts = {}, registration, tls, allowInsecureLoopback = false, requestTimeout = 60000 }) {
   if (!hosts || Object.entries(hosts).some(([id, h]) => !/^[A-Za-z0-9_-]{1,64}$/.test(id) || !/^[a-f0-9]{64}$/.test(h))) throw new Error('Invalid hosts configuration');
   const online = new Map();
+  if (registration?.enabled && !registration.database) throw new Error('Registration database required');
+  const registry = registration?.database ? openRegistry(registration.database, registration.maxHosts ?? 1000) : undefined;
+  const enrollRates = new Map();
   const rates = new Map();
   const agents = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME, perMessageDeflate: false });
   const server = tls ? https.createServer(tls) : http.createServer();
@@ -43,10 +47,42 @@ export function createRelayServer({ hosts, tls, allowInsecureLoopback = false, r
     out.on('close', () => { if (!upgrade) channel.destroy(); });
     return { out, channel };
   }
-  server.on('request', (req, res) => {
+  server.on('request', async (req, res) => {
     if (!transportAllowed(req)) return respond(res, 403, 'tls_required');
     if (!limit(req)) return respond(res, 429, 'rate_limited');
     if (req.url === '/healthz' && req.method === 'GET') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true,"protocol":1}'); return; }
+    if (req.url === '/relay/v1/register' && req.method === 'POST') {
+      if (!registry || !registration.enabled) return respond(res, 403, 'registration_disabled');
+      const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
+      if (!token) return respond(res, 401, 'invalid_registration_credential');
+      const now = Date.now(), ip = req.socket.remoteAddress;
+      for (const [key, value] of enrollRates) if (now - value.at >= 60000) enrollRates.delete(key);
+      const rate = enrollRates.get(ip) || { at: now, count: 0 };
+      if ((!enrollRates.has(ip) && enrollRates.size >= 4096) || ++rate.count > 20) return respond(res, 429, 'registration_rate_limited');
+      enrollRates.set(ip, rate);
+      if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) return respond(res, 400, 'invalid_request');
+      let name;
+      try {
+        let size = 0; const chunks = [];
+        for await (const chunk of req) {
+          if ((size += chunk.length) > 2048) { respond(res, 413, 'payload_too_large'); return; }
+          chunks.push(chunk);
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (!body || typeof body.name !== 'string' || !body.name.trim() || body.name.length > 64 || /[\x00-\x1f\x7f]/.test(body.name)) throw new Error('invalid');
+        name = body.name.trim();
+      } catch { return respond(res, 400, 'invalid_request'); }
+      try {
+        // Client-generated identity prevents credential loss when a response is lost.
+        const candidate = createHash('sha256').update('dsh-remote-host-v1:' + token).digest('hex').slice(0, 32);
+        if (Object.hasOwn(hosts, candidate)) return respond(res, 409, 'legacy_identity_conflict');
+        const hostId = registry.register(token, name);
+        if (!hostId) return respond(res, 503, 'registration_capacity_reached');
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, hostId }));
+      } catch { respond(res, 503, 'registry_unavailable'); }
+      return;
+    }
     const dest = destination(req);
     if (!dest) return respond(res, 404, 'not_found');
     if (!['GET', 'POST', 'HEAD'].includes(req.method)) return respond(res, 405, 'method_not_allowed');
@@ -76,7 +112,8 @@ export function createRelayServer({ hosts, tls, allowInsecureLoopback = false, r
     const match = /^\/relay\/v1\/agent\/([A-Za-z0-9_-]{1,64})$/.exec(req.url || '');
     if (match) {
       const id = match[1], token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
-      if (!token || !hosts[id] || !timingSafeEqual(digest(token), Buffer.from(hosts[id], 'hex'))) return reject(socket, 401);
+      const expected = Object.hasOwn(hosts, id) ? hosts[id] : registry?.tokenHash(id);
+      if (!token || !expected || !timingSafeEqual(digest(token), Buffer.from(expected, 'hex'))) return reject(socket, 401);
       if (online.has(id)) return reject(socket, 409);
       return agents.handleUpgrade(req, socket, head, ws => {
         const tunnel = new Tunnel(ws); online.set(id, tunnel);
@@ -112,6 +149,7 @@ export function createRelayServer({ hosts, tls, allowInsecureLoopback = false, r
       for (const tunnel of online.values()) { tunnel.destroy(); tunnel.ws.terminate(); }
       agents.close(); server.closeAllConnections();
       await new Promise(resolve => server.close(resolve));
+      registry?.close();
     },
   };
 }

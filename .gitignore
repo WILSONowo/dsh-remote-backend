@@ -11,3 +11,5 @@ plugin-secret.json
 *.pem
 *.key
 artifacts/
+*.sqlite
+*.sqlite-*

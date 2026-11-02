@@ -1,12 +1,12 @@
 {
   "name": "dsh-remote-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Server backend for dsh-remote",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
