@@ -13,3 +13,6 @@ plugin-secret.json
 artifacts/
 *.sqlite
 *.sqlite-*
+*.sqlite.status.json
+*.sqlite.status.json.tmp-*
+*.sqlite.tmp-*
