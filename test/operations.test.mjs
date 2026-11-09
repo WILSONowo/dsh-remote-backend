@@ -64,7 +64,7 @@ test('actual entry point starts from private config and writes draining status o
     child.send('SIGTERM'); assert.equal((await exited)[0], 0);
     const status = JSON.parse(readFileSync(database + '.status.json', 'utf8'));
     assert.equal(status.draining, true); assert.equal(status.ready, false);
-    assert.equal(status.requests, 0); assert.equal(status.sockets, 0);
+    assert.equal(status.streams, 0); assert.equal(status.sockets, 0);
   } finally {
     if (child.exitCode === null) { child.kill(); await exited; }
     rmSync(dir, { recursive: true, force: true });

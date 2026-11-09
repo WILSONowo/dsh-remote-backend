@@ -13,7 +13,8 @@ import { Tunnel } from '../lib/tunnel.js';
 import { createRelayServer } from '../src/server.mjs';
 import { openRegistry } from '../src/registry.mjs';
 import { normalizeOptions, clientAddress } from '../src/config.mjs';
-import { createCapacity, isFileRequest } from '../src/resources.mjs';
+import { createCapacity } from '../src/resources.mjs';
+import { openStream, phoneRequest, upgradeStatus } from './phone.mjs';
 import { startStatusWriter } from '../src/operations.mjs';
 import { administer } from '../src/admin.mjs';
 
@@ -59,7 +60,8 @@ async function fixture(t, options = {}) {
     });
     return ws;
   }
-  const url = path => base + '/h/' + hostId + path;
+  const phone = (path, options) => phoneRequest(base, hostId, path, options);
+  const stream = () => openStream(base, hostId);
   t.after(async () => {
     for (const ws of peers) ws.terminate();
     for (const ws of wss.clients) ws.terminate(); wss.close();
@@ -68,43 +70,46 @@ async function fixture(t, options = {}) {
     await new Promise(resolve => desktop.close(resolve));
     rmSync(directory, { recursive: true, force: true });
   });
-  return { relay, agent, url, base, database, hostId, directory, writes: () => writes };
+  return { relay, agent, phone, stream, base, database, hostId, directory, writes: () => writes };
 }
 
-test('RPC deadline continues after response headers; healthy SSE outlives RPC deadline', { timeout: 8000 }, async t => {
-  const f = await fixture(t, { requestTimeout: 120, streamIdleTimeout: 100 }); await f.agent();
-  const stalled = await fetch(f.url('/api/stall'));
-  assert.equal(stalled.status, 200);
-  await assert.rejects(stalled.text());
-  await until(() => f.relay.snapshot().requests === 0);
+test('silent streams expire; streams with traffic outlive the idle limit and release capacity', { timeout: 8000 }, async t => {
+  const f = await fixture(t, { streamIdleTimeout: 100 }); await f.agent();
+  await assert.rejects(f.phone('/api/stall'));
+  await until(() => f.relay.snapshot().streams === 0);
   assert.equal(f.relay.snapshot().timeouts, 1);
-  const controller = new AbortController();
-  const stream = await fetch(f.url('/api/events.host'), { signal: controller.signal });
-  const reader = stream.body.getReader();
-  const start = Date.now();
-  while (Date.now() - start < 280) assert.equal((await reader.read()).done, false);
-  controller.abort(); await until(() => f.relay.snapshot().requests === 0);
+  const events = await new Promise((resolve, reject) => {
+    const req = http.get({ path: '/api/events.host', createConnection: () => f.stream() }, resolve); req.on('error', reject);
+  });
+  const start = Date.now(); let received = 0;
+  events.on('data', () => { received++; });
+  await delay(300); assert.ok(Date.now() - start >= 280); assert.ok(received > 3); assert.equal(events.destroyed, false);
+  events.destroy(); await until(() => f.relay.snapshot().streams === 0);
 });
 
-test('file upload outlives RPC timeout; stalled file expires; oversized upload is bounded', { timeout: 8000 }, async t => {
-  const f = await fixture(t, { requestTimeout: 100, fileIdleTimeout: 250, fileBytesPerSecond: 32768, maxBodyBytes: 20000 }); await f.agent();
-  const uploaded = await fetch(f.url('/api/remote-access/fs/write'), { method: 'POST', body: Buffer.alloc(16000) });
-  assert.equal(uploaded.status, 200); assert.equal(await uploaded.text(), 'ok');
-  const stalled = await fetch(f.url('/api/remote-access/fs/read?stall=1')); await assert.rejects(stalled.text());
-  const large = await fetch(f.url('/api/remote-access/fs/write'), { method: 'POST', body: Buffer.alloc(20001) });
-  assert.equal(large.status, 413); await large.text();
-  await until(() => f.relay.snapshot().requests === 0);
-  assert.equal(f.writes(), 1);
+test('streamBytesPerSecond throttles each stream; zero means unthrottled', { timeout: 8000 }, async t => {
+  const slow = await fixture(t, { streamBytesPerSecond: 32768 }); await slow.agent();
+  let start = Date.now();
+  assert.equal((await slow.phone('/api/remote-access/fs/read')).data.length, 16384);
+  assert.ok(Date.now() - start >= 400, 'download throttled');
+  start = Date.now();
+  assert.equal((await slow.phone('/api/upload', { body: Buffer.alloc(16384) })).data.toString(), 'ok');
+  assert.ok(Date.now() - start >= 400, 'upload throttled');
+  const fast = await fixture(t); await fast.agent();
+  start = Date.now();
+  assert.equal((await fast.phone('/api/remote-access/fs/read')).data.length, 16384);
+  assert.ok(Date.now() - start < 400);
+  assert.throws(() => normalizeOptions({ registration: { database: ':memory:' }, streamBytesPerSecond: -1 }), /streamBytesPerSecond/);
 });
 
-test('WebSocket heartbeat keeps stream alive; idle stream closes and releases capacity', { timeout: 8000 }, async t => {
+test('WebSocket heartbeat inside the stream keeps it alive; idle stream closes and releases capacity', { timeout: 8000 }, async t => {
   const f = await fixture(t, { streamIdleTimeout: 150 }); await f.agent();
-  const ws = new WebSocket(f.url('/api/events.mux').replace('http:', 'ws:'));
+  const ws = new WebSocket('ws://phone.e2e.dsh.invalid/api/events.mux', { createConnection: () => f.stream() });
   t.after(() => ws.terminate()); await once(ws, 'open');
   const timer = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.ping(); }, 30);
   t.after(() => clearInterval(timer)); await delay(350); assert.equal(ws.readyState, WebSocket.OPEN);
   clearInterval(timer); await until(() => ws.readyState === WebSocket.CLOSED);
-  await until(() => f.relay.snapshot().requests === 0);
+  await until(() => f.relay.snapshot().streams === 0);
 });
 
 test('online computer limit rejects another identity without evicting the first', { timeout: 8000 }, async t => {
@@ -123,21 +128,6 @@ test('registry failure reports unready and fails closed for connected computers'
   assert.equal(f.relay.snapshot().ready, false);
 });
 
-test('file throttle and file concurrency preserve RPC capacity and release all slots', { timeout: 8000 }, async t => {
-  const f = await fixture(t, { maxFiles: 1, maxFilesPerHost: 1, fileBytesPerSecond: 32768, requestTimeout: 120, fileIdleTimeout: 500 }); await f.agent();
-  const start = Date.now();
-  const transfer = fetch(f.url('/api/remote-access/fs/read')).then(async r => { assert.equal(r.status, 200); return r.arrayBuffer(); });
-  await until(() => f.relay.snapshot().files === 1);
-  const busy = await fetch(f.url('/api/remote-access/fs/read')); assert.equal(busy.status, 429); await busy.text();
-  const rpcStart = Date.now();
-  assert.equal(await (await fetch(f.url('/api/echo'))).text(), 'ok');
-  assert.ok(Date.now() - rpcStart < 400);
-  assert.equal((await transfer).byteLength, 16384);
-  assert.ok(Date.now() - start >= 450);
-  await until(() => f.relay.snapshot().requests === 0);
-  assert.equal(f.relay.snapshot().files, 0);
-});
-
 test('stale agent is replaced, live duplicate is rejected, concurrent probes retry with 503', { timeout: 8000 }, async t => {
   const f = await fixture(t, { duplicateProbeTimeout: 150 });
   const old = await f.agent(false);
@@ -148,7 +138,7 @@ test('stale agent is replaced, live duplicate is rejected, concurrent probes ret
   assert.equal(next.readyState, WebSocket.OPEN);
   assert.equal(f.relay.snapshot().staleConnections, 1);
   await assert.rejects(f.agent(), /409/);
-  assert.equal(await (await fetch(f.url('/api/echo'))).text(), 'ok');
+  assert.equal((await f.phone('/api/echo')).data.toString(), 'ok');
 });
 
 test('administrator disable disconnects live agent; enable works; revoke cannot re-enroll', { timeout: 8000 }, async t => {
@@ -189,21 +179,23 @@ test('proxy chain stops at first untrusted hop and configuration fails closed', 
   }
 });
 
-test('capacity is bounded globally and per host; release is idempotent; file paths are exact', () => {
-  const capacity = createCapacity({ maxRequests: 3, maxRequestsPerHost: 2, maxFiles: 1, maxFilesPerHost: 1 });
-  const a = capacity.acquire('a', true), b = capacity.acquire('a', false), c = capacity.acquire('b', false);
-  assert.equal(capacity.acquire('a', false), undefined); assert.equal(capacity.acquire('c', false), undefined);
-  a(); a(); assert.deepEqual(capacity.snapshot(), { requests: 2, files: 0 }); b(); c();
-  assert.deepEqual(capacity.snapshot(), { requests: 0, files: 0 });
-  assert.equal(isFileRequest('/api/remote-access/fs/read?path=x'), true);
-  assert.equal(isFileRequest('/api/remote-access/fs/write'), true);
-  assert.equal(isFileRequest('/api/remote-access/fs/reader'), false);
-  assert.equal(isFileRequest('/api/rpc'), false);
+test('stream capacity is bounded globally and per host; release is idempotent; HTTP-era options are ignored', () => {
+  const capacity = createCapacity({ maxRequests: 3, maxRequestsPerHost: 2 });
+  const a = capacity.acquire('a'), b = capacity.acquire('a'), c = capacity.acquire('b');
+  assert.equal(capacity.acquire('a'), undefined); assert.equal(capacity.acquire('c'), undefined);
+  a(); a(); assert.deepEqual(capacity.snapshot(), { streams: 2 }); b(); c();
+  assert.deepEqual(capacity.snapshot(), { streams: 0 });
+  const legacy = normalizeOptions({ registration: { database: ':memory:' }, maxFiles: 0, fileBytesPerSecond: 'x', maxBodyBytes: 1 });
+  assert.deepEqual(legacy.ignoredOptions, ['maxFiles', 'fileBytesPerSecond', 'maxBodyBytes']);
+  assert.equal(legacy.maxFiles, undefined); assert.equal(legacy.streamBytesPerSecond, 0);
 });
 
 test('shutdown drains completed requests, bounds streams and is idempotent', { timeout: 8000 }, async t => {
   const f = await fixture(t, { shutdownTimeout: 120 }); await f.agent();
-  const stream = await fetch(f.url('/api/events.host')); const reader = stream.body.getReader(); await reader.read();
+  const events = await new Promise((resolve, reject) => {
+    const req = http.get({ path: '/api/events.host', createConnection: () => f.stream() }, resolve); req.on('error', reject);
+  });
+  await once(events, 'data'); events.on('error', () => {});
   const started = Date.now(), closed = f.relay.close(); assert.equal(f.relay.close(), closed);
   await closed; assert.ok(Date.now() - started < 1500);
   assert.equal(f.relay.snapshot().draining, true);
@@ -227,16 +219,16 @@ test('socket cap bounds idle connections and releases them', { timeout: 8000 }, 
   assert.ok(f.relay.snapshot().sockets <= 4); connections.forEach(s => s.destroy());
 });
 
-test('global and per-host request admission refuses excess HTTP work and recovers after cancel', { timeout: 8000 }, async t => {
-  const f = await fixture(t, { maxRequests: 2, maxRequestsPerHost: 2, maxFiles: 1, maxFilesPerHost: 1, requestTimeout: 2000 }); await f.agent();
-  const controllers = [new AbortController(), new AbortController()];
-  t.after(() => controllers.forEach(c => c.abort()));
-  for (const controller of controllers) await fetch(f.url('/api/stall'), { signal: controller.signal });
-  assert.equal(f.relay.snapshot().requests, 2);
-  const busy = await fetch(f.url('/api/echo')); assert.equal(busy.status, 429); await busy.text();
-  controllers[0].abort(); await until(() => f.relay.snapshot().requests === 1);
-  assert.equal(await (await fetch(f.url('/api/echo'))).text(), 'ok');
-  controllers[1].abort(); await until(() => f.relay.snapshot().requests === 0);
+test('global and per-host stream admission refuses excess streams and recovers after cancel', { timeout: 8000 }, async t => {
+  const f = await fixture(t, { maxRequests: 2, maxRequestsPerHost: 2 }); await f.agent();
+  const held = [f.stream(), f.stream()];
+  t.after(() => held.forEach(s => s.destroy()));
+  await Promise.all(held.map(s => once(s.ws, 'open')));
+  await until(() => f.relay.snapshot().streams === 2);
+  assert.equal(await upgradeStatus(f.base, f.hostId), 429);
+  held[0].destroy(); await until(() => f.relay.snapshot().streams === 1);
+  assert.equal((await f.phone('/api/echo')).data.toString(), 'ok');
+  held[1].destroy(); await until(() => f.relay.snapshot().streams === 0);
 });
 
 test('registration body has a bounded deadline even without Content-Length', { timeout: 8000 }, async t => {

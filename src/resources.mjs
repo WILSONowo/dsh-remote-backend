@@ -13,31 +13,25 @@ export function createLimiter(maxEntries) {
   };
 }
 
+/** Concurrent phone streams (each one TLS session = one tunnel channel), bounded globally and per computer. */
 export function createCapacity(options) {
   const hosts = new Map();
-  let requests = 0, files = 0;
+  let streams = 0;
   return {
-    snapshot: () => ({ requests, files }),
-    acquire(id, file) {
-      const host = hosts.get(id) ?? { requests: 0, files: 0 };
-      if (requests >= options.maxRequests || host.requests >= options.maxRequestsPerHost ||
-          file && (files >= options.maxFiles || host.files >= options.maxFilesPerHost)) return;
-      hosts.set(id, host); requests++; host.requests++;
-      if (file) { files++; host.files++; }
+    snapshot: () => ({ streams }),
+    acquire(id) {
+      const host = hosts.get(id) ?? { streams: 0 };
+      if (streams >= options.maxRequests || host.streams >= options.maxRequestsPerHost) return;
+      hosts.set(id, host); streams++; host.streams++;
       let released = false;
       return () => {
         if (released) return;
-        released = true; requests--; host.requests--;
-        if (file) { files--; host.files--; }
-        if (!host.requests) hosts.delete(id);
+        released = true; streams--; host.streams--;
+        if (!host.streams) hosts.delete(id);
       };
     },
   };
 }
-
-// Explicit file API classification; do not throttle control RPC or event streams.
-export const isFileRequest = path => /^\/api\/remote-access\/fs\/(read|write)(?:\?|$)/.test(path);
-export const isEventRequest = path => /^\/api\/events\.(mux|host)(?:\?|$)/.test(path);
 
 /** Each transform has at most one incoming chunk and one timer in flight. */
 export class Transfer extends Transform {

@@ -9,14 +9,11 @@
 | 配置 | 默认值 | 用途 |
 | --- | ---: | --- |
 | `maxSockets` / `maxAgents` | 512 / 256 | 总 TCP 连接 / 在线电脑 |
-| `maxRequests` / `maxRequestsPerHost` | 256 / 48 | 同时转发的 HTTP、SSE、WebSocket |
-| `maxFiles` / `maxFilesPerHost` | 8 / 2 | 文件传输并发，必须小于对应总请求上限 |
-| `fileBytesPerSecond` | 262144 | 每个文件请求每方向每秒字节数，约 256 KiB/s |
-| `maxBodyBytes` | 67108864 | 单次上传上限，64 MiB |
-| `requestTimeout` | 60000 | 普通 RPC 从接入到响应结束的总时限，毫秒 |
-| `fileIdleTimeout` | 60000 | 文件传输连续无进展时限 |
-| `streamIdleTimeout` | 120000 | SSE / WebSocket 无数据时限；正常心跳刷新计时 |
-| `handshakeTimeout` | 15000 | 设备 WebSocket 上游握手时限 |
+| `maxRequests` / `maxRequestsPerHost` | 256 / 48 | 同时打开的手机通道（每条是一个加密会话，对应一条隧道通道） |
+| `streamBytesPerSecond` | 0 | 每条通道每个方向的字节速率上限，0 表示不限（可为 0 的非负整数） |
+| `requestTimeout` | 60000 | 注册请求正文和请求头的时限，毫秒 |
+| `streamIdleTimeout` | 120000 | 通道内无数据时限；App 的心跳会刷新计时 |
+| `handshakeTimeout` | 15000 | 手机通道 WebSocket 握手时限 |
 | `duplicateProbeTimeout` | 1500 | 重复电脑连接的旧连接探测时限 |
 | `revocationInterval` | 500 | 检查电脑禁用 / 撤销的周期 |
 | `shutdownTimeout` | 5000 | 停止接收新连接后的最长排空时间 |
@@ -25,7 +22,7 @@
 | `trustedProxies` | `[]` | 信任的代理 IP / CIDR，默认忽略转发头 |
 | `statusFile` | 数据库路径加 `.status.json` | 私有汇总状态文件，每 5 秒更新 |
 
-文件专项限制目前匹配 `/api/remote-access/fs/read`、`/api/remote-access/fs/write`，含查询参数。新增文件 API 时须同步匹配规则和测试。文件流使用空闲超时，不因正常慢速传输超过 RPC 总时限而中断；请求头和注册请求正文另有超时保护。长连接占用请求名额，文件上限预留了控制请求容量。超限直接拒绝，不排队或自动重放操作。
+自 3.0.0 起服务器只透传加密字节，看不到请求路径，因此无法再区分文件与普通请求；资源控制按通道进行。旧的 `maxFiles`、`maxFilesPerHost`、`fileBytesPerSecond`、`fileIdleTimeout`、`maxBodyBytes` 会被忽略并在启动时警告，可从配置中删除。超限直接拒绝（429），不排队或自动重放操作。手机单个 WebSocket 帧上限 32 KiB，文本帧会被断开。
 
 `trustedProxies` 只填实际代理地址，不能填所有地址。仅当直接连接来源受信时才解析 `X-Forwarded-For`，从右向左跳过可信代理，在首个不可信地址停止；格式错误拒绝请求。它只用于本服务限流，不把转发头传给电脑。
 

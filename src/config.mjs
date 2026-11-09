@@ -2,12 +2,13 @@ import { BlockList, isIP } from 'node:net';
 
 export const DEFAULTS = Object.freeze({
   maxSockets: 512, maxAgents: 256, maxRequests: 256, maxRequestsPerHost: 48,
-  maxFiles: 8, maxFilesPerHost: 2, fileBytesPerSecond: 262144,
   requestsPerMinute: 600, registrationsPerMinute: 20, maxRateEntries: 4096,
-  requestTimeout: 60000, fileIdleTimeout: 60000, streamIdleTimeout: 120000,
+  requestTimeout: 60000, streamIdleTimeout: 120000,
   handshakeTimeout: 15000, duplicateProbeTimeout: 1500, revocationInterval: 500,
-  shutdownTimeout: 5000, maxBodyBytes: 67108864,
+  shutdownTimeout: 5000,
 });
+/** Options that only made sense while the relay parsed HTTP (protocol 1). Ignored with a startup warning. */
+export const OBSOLETE_OPTIONS = Object.freeze(['maxFiles', 'maxFilesPerHost', 'fileBytesPerSecond', 'fileIdleTimeout', 'maxBodyBytes']);
 
 export function normalizeOptions(options) {
   if (!options || typeof options !== 'object') throw new Error('Invalid server configuration');
@@ -20,7 +21,12 @@ export function normalizeOptions(options) {
     result[key] = value;
   }
   if (result.maxRequestsPerHost > 64) throw new Error('maxRequestsPerHost exceeds protocol channel limit (64)');
-  if (result.maxFilesPerHost >= result.maxRequestsPerHost || result.maxFiles >= result.maxRequests) throw new Error('File limits must leave capacity for control requests');
+  // Per stream, per direction; 0 disables throttling.
+  const throttle = options.streamBytesPerSecond ?? 0;
+  if (!Number.isSafeInteger(throttle) || throttle < 0 || throttle > 2147483647) throw new Error('Invalid streamBytesPerSecond');
+  result.streamBytesPerSecond = throttle;
+  result.ignoredOptions = OBSOLETE_OPTIONS.filter(key => Object.hasOwn(options, key));
+  for (const key of result.ignoredOptions) delete result[key];
   if (options.registration.enabled !== undefined && typeof options.registration.enabled !== 'boolean') throw new Error('Invalid registration.enabled');
   if (options.allowInsecureLoopback !== undefined && typeof options.allowInsecureLoopback !== 'boolean') throw new Error('Invalid allowInsecureLoopback');
   result.trustProxy = trustedProxy(options.trustedProxies ?? []);
