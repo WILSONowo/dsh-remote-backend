@@ -106,8 +106,13 @@ test('health, offline isolation, registration and opaque byte relay', { timeout:
   const f = await fixture(t);
   assert.deepEqual(JSON.parse((await f.request('/healthz')).data), { ok: true, protocol: 2 });
   assert.equal(await upgradeStatus(f.origin, f.hostId), 503);
+  const presence = async id => JSON.parse((await f.request('/relay/v2/presence/' + id)).data);
+  assert.deepEqual(await presence(f.hostId), { online: false });
   await assert.rejects(f.agent(randomBytes(32).toString('hex')), /401/);
   await f.agent(); await assert.rejects(f.agent(), /409/);
+  assert.deepEqual(await presence(f.hostId), { online: true });
+  assert.deepEqual(await presence('0'.repeat(32)), { online: false });
+  assert.equal((await f.request('/relay/v2/presence/not-an-id')).status, 404);
   assert.equal(await upgradeStatus(f.origin, '0'.repeat(32)), 503);
   assert.equal(await upgradeStatus(f.origin, f.hostId, { protocols: ['chat'] }), 400);
   // Protocol 1 plaintext forwarding is gone for HTTP and WebSocket alike.

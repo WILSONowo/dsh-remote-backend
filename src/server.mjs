@@ -103,6 +103,13 @@ export function createRelayServer(options) {
       } catch (error) { fail(res, error.message === 'identity_disabled' ? 403 : 503, error.message === 'identity_disabled' ? 'identity_disabled' : 'registry_unavailable'); }
       return;
     }
+    // Presence for the phone's computer list: whether that computer's agent is connected right now.
+    // Unknown ids answer like offline ones, so this does not reveal which ids are registered.
+    const presence = /^\/relay\/v2\/presence\/([a-f0-9]{32})$/.exec(req.url || '');
+    if (presence && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ online: online.has(presence[1]) })); return;
+    }
     // The plaintext /h/<hostId>/api forwarding of protocol 1 is gone: it exposed tokens to the relay.
     return respond(res, 404, 'not_found');
   }
